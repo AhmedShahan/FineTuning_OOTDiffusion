@@ -1,0 +1,29 @@
+# ---- Python cache ----
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ---- Virtual environments ----
+env/
+venv/
+.venv/
+
+# ---- Environment variables ----
+.env
+.env.*
+
+# ---- Data (raw / generated) ----
+data/
+datasets/
+data_raw/
+data_processed/
+
+# ---- Logs & temp files ----
+*.log
+*.tmp
+
+# ---- OS / editor noise ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
