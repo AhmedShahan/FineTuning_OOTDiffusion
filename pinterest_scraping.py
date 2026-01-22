@@ -1,332 +1,401 @@
 #!/usr/bin/env python3
 """
-Pinterest Image Scraper - Enhanced Version with Better Detection
-Handles Pinterest's dynamic content loading
+Pinterest Image Scraper - High-Resolution + Target Count + No Duplicates
+
+What this version does:
+- Searches Pinterest for a keyword
+- Continuously scrolls & discovers new image URLs
+- Downloads ONLY images with width >= MIN_WIDTH and height >= MIN_HEIGHT
+- Stops after saving TOTAL_IMAGES images
+- Never saves the same image twice (URL dedupe + content-hash dedupe)
+
+Requirements:
+- selenium
+- requests
+- pillow
+
+Install:
+  pip install selenium requests pillow
 """
 
 import os
 import time
-import json
-import requests
 import re
+import hashlib
+from io import BytesIO
+from urllib.parse import quote
+
+import requests
+from PIL import Image
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
+
 
 # ============================================
 # EASY CONFIGURATION - JUST EDIT THESE!
 # ============================================
 
-SEARCH_KEYWORD = "Jubba for man"                 # What to search for
-OUTPUT_FOLDER = "data_raw/pinterest_downloads"      # Folder to save images
-NUM_SCROLLS = 10                           # How many times to scroll (more = more images)
-SCROLL_PAUSE = 3                           # Seconds between scrolls
-HEADLESS = False                           # True = hidden browser, False = see browser window
+SEARCH_KEYWORD = "Jubba for man"
+OUTPUT_FOLDER = "data_raw/pinterest_downloads"
+
+TOTAL_IMAGES = 2000
+
+MIN_WIDTH = 1080
+MIN_HEIGHT = 720
+
+SCROLL_PAUSE = 3            # seconds between scrolls
+SCROLL_STEP = 2             # how many scrolls per loop iteration
+MAX_SCROLLS = 5000          # safety limit so it won't loop forever
+
+HEADLESS = False            # True = hidden browser, False = see browser window
+
+REQUEST_TIMEOUT = 25
+POLITE_DELAY = 0.15         # small delay between downloads
 
 # ============================================
 
+
 class PinterestScraper:
-    def __init__(self, keyword, output_folder, num_scrolls=10, scroll_pause=3, headless=False):
+    def __init__(
+        self,
+        keyword,
+        output_folder,
+        total_images=2000,
+        min_width=1080,
+        min_height=720,
+        scroll_pause=3,
+        scroll_step=2,
+        max_scrolls=5000,
+        headless=False,
+    ):
         self.keyword = keyword
         self.output_folder = output_folder
-        self.num_scrolls = num_scrolls
+
+        self.total_images = total_images
+        self.min_width = min_width
+        self.min_height = min_height
+
         self.scroll_pause = scroll_pause
+        self.scroll_step = scroll_step
+        self.max_scrolls = max_scrolls
         self.headless = headless
+
         self.driver = None
-        self.image_urls = set()
-        
+
+        # Dedupe controls
+        self.seen_urls = set()       # URLs we already attempted
+        self.saved_hashes = set()    # content-hash of saved images (strong dedupe)
+
+        self.stored_count = 0
+
+        # Output folder per keyword
+        self.folder_path = os.path.join(
+            self.output_folder, self.keyword.replace(" ", "_")
+        )
+
+    # ---------------------------
+    # Browser setup / navigation
+    # ---------------------------
     def setup_driver(self):
-        """Initialize Chrome WebDriver"""
         print("⚙️  Setting up Chrome WebDriver...")
-        
+
         options = Options()
-        
         if self.headless:
-            options.add_argument('--headless')
-        
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-blink-features=AutomationControlled')
-        options.add_argument('--window-size=1920,1080')
-        options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-        
+            options.add_argument("--headless=new")
+
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument(
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option('useAutomationExtension', False)
+        options.add_experimental_option("useAutomationExtension", False)
         options.add_experimental_option("prefs", {
             "profile.default_content_setting_values.notifications": 2,
             "profile.default_content_settings.popups": 0,
         })
-        
+
         self.driver = webdriver.Chrome(options=options)
-        
-        # Stealth mode
-        self.driver.execute_cdp_cmd('Network.setUserAgentOverride', {
-            "userAgent": 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        })
-        self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        
+
+        # Stealth-ish tweaks (not guaranteed vs Pinterest)
+        try:
+            self.driver.execute_cdp_cmd("Network.setUserAgentOverride", {
+                "userAgent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+            })
+            self.driver.execute_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+        except Exception:
+            pass
+
         print("✅ WebDriver ready!\n")
-        
+
     def open_pinterest(self):
-        """Open Pinterest search page"""
-        search_url = f"https://www.pinterest.com/search/pins/?q={self.keyword.replace(' ', '%20')}"
-        
+        query = quote(self.keyword)
+        search_url = f"https://www.pinterest.com/search/pins/?q={query}"
+
         print(f"🌐 Opening: {search_url}")
         self.driver.get(search_url)
-        
-        print(f"⏳ Waiting for page load...")
+
+        print("⏳ Waiting for page load...")
         time.sleep(5)
-        
-        # Handle any popups
+
+        # Close popups if any
         try:
-            # Try to close any modals
             close_buttons = self.driver.find_elements(By.CSS_SELECTOR, '[aria-label="Close"]')
             for btn in close_buttons:
                 try:
                     btn.click()
-                    time.sleep(0.5)
-                except:
+                    time.sleep(0.3)
+                except Exception:
                     pass
-        except:
+        except Exception:
             pass
-        
+
         print("✅ Page loaded!\n")
-        
-    def scroll_and_load(self):
-        """Scroll page to load more images"""
-        print(f"📜 Scrolling page {self.num_scrolls} times...\n")
-        
-        last_height = self.driver.execute_script("return document.body.scrollHeight")
-        
-        for i in range(self.num_scrolls):
-            # Scroll down
+
+    # ---------------------------
+    # Scrolling / extraction
+    # ---------------------------
+    def scroll_chunk(self, times=2):
+        """Scroll a few times to load more content"""
+        for _ in range(times):
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            
-            print(f"   Scroll {i+1}/{self.num_scrolls} - Waiting {self.scroll_pause}s for content to load...")
             time.sleep(self.scroll_pause)
-            
-            # Check if we've reached the bottom
-            new_height = self.driver.execute_script("return document.body.scrollHeight")
-            
-            if new_height == last_height:
-                print(f"   ℹ️  No more content loading (reached bottom at scroll {i+1})")
-                break
-                
-            last_height = new_height
-        
-        # One final scroll to top to ensure all images are in viewport
-        self.driver.execute_script("window.scrollTo(0, 0);")
-        time.sleep(1)
-        
-        print("\n✅ Scrolling complete!\n")
-        
+
     def extract_images(self):
-        """Extract all image URLs from page"""
-        print("🔍 Extracting image URLs from page...\n")
-        
-        # Multiple methods to find images
-        methods = [
-            ('CSS: img[src*="pinimg.com"]', By.CSS_SELECTOR, 'img[src*="pinimg.com"]'),
-            ('CSS: img[srcset*="pinimg.com"]', By.CSS_SELECTOR, 'img[srcset*="pinimg.com"]'),
-            ('CSS: img', By.CSS_SELECTOR, 'img'),
-            ('TAG: img', By.TAG_NAME, 'img'),
-        ]
-        
-        for method_name, by_type, selector in methods:
-            try:
-                elements = self.driver.find_elements(by_type, selector)
-                print(f"   {method_name}: Found {len(elements)} elements")
-                
-                for element in elements:
-                    self._extract_url_from_element(element)
-                    
-            except Exception as e:
-                print(f"   ⚠️  {method_name} failed: {str(e)[:50]}")
-        
-        # Also check page source for any missed URLs
-        page_source = self.driver.page_source
-        pinimg_urls = re.findall(r'https://i\.pinimg\.com/[^"\'>\s]+', page_source)
-        
-        for url in pinimg_urls:
-            if url not in self.image_urls:
-                self.image_urls.add(self._upgrade_url_quality(url))
-        
-        print(f"\n✅ Total unique images found: {len(self.image_urls)}\n")
-        
-        return list(self.image_urls)
-    
-    def _extract_url_from_element(self, element):
-        """Extract URL from an image element"""
+        """
+        Extract pinimg.com URLs from:
+        - img[src]
+        - img[data-src]
+        - img[srcset]
+        - page source regex fallback
+        """
+        urls = set()
+
+        # Method 1: direct img tags
         try:
-            # Try different attributes
-            url = None
-            
-            # Try src
-            src = element.get_attribute('src')
-            if src and 'pinimg.com' in src:
-                url = src
-            
-            # Try data-src
-            if not url:
-                data_src = element.get_attribute('data-src')
-                if data_src and 'pinimg.com' in data_src:
-                    url = data_src
-            
-            # Try srcset
-            if not url:
-                srcset = element.get_attribute('srcset')
-                if srcset and 'pinimg.com' in srcset:
-                    # Parse srcset (format: "url 1x, url 2x")
-                    urls = re.findall(r'(https://[^\s,]+)', srcset)
-                    if urls:
-                        url = urls[-1]  # Get highest resolution
-            
-            if url:
-                # Clean and upgrade URL
-                url = url.split('?')[0]  # Remove query parameters
-                url = self._upgrade_url_quality(url)
-                self.image_urls.add(url)
-                
-        except Exception as e:
+            imgs = self.driver.find_elements(By.TAG_NAME, "img")
+            for img in imgs:
+                # src
+                src = img.get_attribute("src")
+                if src and "pinimg.com" in src:
+                    urls.add(self._normalize_and_upgrade_url(src))
+
+                # data-src
+                data_src = img.get_attribute("data-src")
+                if data_src and "pinimg.com" in data_src:
+                    urls.add(self._normalize_and_upgrade_url(data_src))
+
+                # srcset (take last = largest candidate)
+                srcset = img.get_attribute("srcset")
+                if srcset and "pinimg.com" in srcset:
+                    found = re.findall(r"(https://[^\s,]+)", srcset)
+                    if found:
+                        urls.add(self._normalize_and_upgrade_url(found[-1]))
+        except Exception:
             pass
-    
-    def _upgrade_url_quality(self, url):
-        """Convert image URL to highest quality version"""
-        # Pinterest image URL structure: https://i.pinimg.com/{size}/...
-        # Sizes: 236x, 474x, 564x, 736x, originals
-        
-        replacements = ['/236x/', '/474x/', '/564x/', '/736x/']
-        
-        for size in replacements:
+
+        # Method 2: regex fallback on full HTML
+        try:
+            page_source = self.driver.page_source
+            pinimg_urls = re.findall(r"https://i\.pinimg\.com/[^\"'>\s]+", page_source)
+            for u in pinimg_urls:
+                urls.add(self._normalize_and_upgrade_url(u))
+        except Exception:
+            pass
+
+        return list(urls)
+
+    def _normalize_and_upgrade_url(self, url: str) -> str:
+        """Clean URL and upgrade known Pinterest sizes to originals when possible."""
+        if not url:
+            return url
+
+        url = url.split("?")[0].strip()
+
+        # Pinterest often uses: /236x/ /474x/ /564x/ /736x/ -> try /originals/
+        for size in ("/236x/", "/474x/", "/564x/", "/736x/"):
             if size in url:
-                return url.replace(size, '/originals/')
-        
+                url = url.replace(size, "/originals/")
+                break
+
         return url
-    
-    def download_images(self, image_urls):
-        """Download all images to folder"""
-        # Create folder
-        folder_path = os.path.join(self.output_folder, self.keyword.replace(' ', '_'))
-        os.makedirs(folder_path, exist_ok=True)
-        
-        print(f"💾 Downloading {len(image_urls)} images to: {folder_path}\n")
-        
+
+    # ---------------------------
+    # Download + resolution filter
+    # ---------------------------
+    def _get_dimensions(self, content_bytes):
+        """Return (width, height) or (None, None)."""
+        try:
+            im = Image.open(BytesIO(content_bytes))
+            return im.size  # (w, h)
+        except Exception:
+            return None, None
+
+    def download_candidate_urls(self, candidate_urls):
+        """Try downloading candidate URLs and save those meeting resolution constraints."""
+        os.makedirs(self.folder_path, exist_ok=True)
+
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': 'https://www.pinterest.com/',
-            'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.pinterest.com/",
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         }
-        
-        success_count = 0
-        fail_count = 0
-        
-        for idx, url in enumerate(image_urls, 1):
+
+        for url in candidate_urls:
+            if self.stored_count >= self.total_images:
+                return
+
+            # URL dedupe
+            if url in self.seen_urls:
+                continue
+            self.seen_urls.add(url)
+
             try:
-                # Get file extension
-                ext = '.jpg'
-                if '.png' in url.lower():
-                    ext = '.png'
-                elif '.gif' in url.lower():
-                    ext = '.gif'
-                elif '.webp' in url.lower():
-                    ext = '.webp'
-                
-                filename = f"{self.keyword.replace(' ', '_')}_{idx:04d}{ext}"
-                filepath = os.path.join(folder_path, filename)
-                
-                # Skip if already exists
-                if os.path.exists(filepath):
-                    print(f"   [{idx}/{len(image_urls)}] ⏭️  {filename} (already exists)")
-                    success_count += 1
+                r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+                r.raise_for_status()
+
+                content = r.content
+                if not content or len(content) < 1024:  # ignore tiny responses
                     continue
-                
-                # Download
-                response = requests.get(url, headers=headers, timeout=15)
-                response.raise_for_status()
-                
-                # Save
-                with open(filepath, 'wb') as f:
-                    f.write(response.content)
-                
-                file_size = len(response.content) / 1024
-                success_count += 1
-                print(f"   [{idx}/{len(image_urls)}] ✅ {filename} ({file_size:.1f} KB)")
-                
-                time.sleep(0.2)  # Polite delay
-                
-            except Exception as e:
-                fail_count += 1
-                print(f"   [{idx}/{len(image_urls)}] ❌ Failed: {str(e)[:60]}")
-        
-        # Summary
-        print("\n" + "="*70)
-        print("📊 DOWNLOAD COMPLETE!")
-        print("="*70)
-        print(f"  Keyword:        {self.keyword}")
-        print(f"  Total Found:    {len(image_urls)}")
-        print(f"  ✅ Success:     {success_count}")
-        print(f"  ❌ Failed:      {fail_count}")
-        print(f"  📁 Location:    {folder_path}")
-        print("="*70 + "\n")
-        
+
+                # Strong dedupe by content hash (prevents same image via different URLs)
+                content_hash = hashlib.md5(content).hexdigest()
+                if content_hash in self.saved_hashes:
+                    continue
+
+                w, h = self._get_dimensions(content)
+                if not w or not h:
+                    continue
+
+                # Resolution filter
+                if w < self.min_width or h < self.min_height:
+                    continue
+
+                # Passed -> save
+                self.saved_hashes.add(content_hash)
+                self.stored_count += 1
+
+                # Determine extension
+                ext = ".jpg"
+                ct = (r.headers.get("Content-Type") or "").lower()
+                if "png" in ct:
+                    ext = ".png"
+                elif "webp" in ct:
+                    ext = ".webp"
+                elif "gif" in ct:
+                    ext = ".gif"
+
+                filename = f"{self.keyword.replace(' ', '_')}_{self.stored_count:05d}_{w}x{h}{ext}"
+                filepath = os.path.join(self.folder_path, filename)
+
+                with open(filepath, "wb") as f:
+                    f.write(content)
+
+                print(f"✅ Saved {self.stored_count}/{self.total_images}: {filename}")
+
+                time.sleep(POLITE_DELAY)
+
+            except Exception:
+                # Skip failures silently (uncomment for debugging)
+                # print(f"❌ Failed: {url} | {str(e)[:80]}")
+                continue
+
+    # ---------------------------
+    # Main loop
+    # ---------------------------
     def run(self):
-        """Main execution flow"""
         try:
             self.setup_driver()
             self.open_pinterest()
-            self.scroll_and_load()
-            image_urls = self.extract_images()
-            
-            if self.driver:
-                self.driver.quit()
-                print("🔒 Browser closed\n")
-            
-            if image_urls:
-                self.download_images(image_urls)
-            else:
-                print("⚠️  No images found!")
-                print("   Possible issues:")
-                print("   - Pinterest blocked the request")
-                print("   - Try with HEADLESS = False to see the browser")
-                print("   - Check your internet connection")
-                
+
+            scrolls_done = 0
+
+            print("=" * 70)
+            print("🚀 Starting scrape loop")
+            print(f"Target: {self.total_images} images")
+            print(f"Min resolution: {self.min_width}x{self.min_height}")
+            print(f"Output: {self.folder_path}")
+            print("=" * 70)
+
+            while self.stored_count < self.total_images and scrolls_done < self.max_scrolls:
+                candidate_urls = self.extract_images()
+                if candidate_urls:
+                    self.download_candidate_urls(candidate_urls)
+
+                if self.stored_count >= self.total_images:
+                    break
+
+                # Scroll for newer images
+                self.scroll_chunk(times=self.scroll_step)
+                scrolls_done += self.scroll_step
+
+                print(
+                    f"📌 Progress: stored={self.stored_count}/{self.total_images} | "
+                    f"seen_urls={len(self.seen_urls)} | scrolls={scrolls_done}/{self.max_scrolls}"
+                )
+
+            print("\n" + "=" * 70)
+            print("📊 FINISHED")
+            print(f"Keyword:        {self.keyword}")
+            print(f"Stored:         {self.stored_count}/{self.total_images}")
+            print(f"Seen URLs:      {len(self.seen_urls)}")
+            print(f"Unique saved:   {len(self.saved_hashes)}")
+            print(f"Scrolls used:   {scrolls_done}/{self.max_scrolls}")
+            print(f"Location:       {self.folder_path}")
+            print("=" * 70 + "\n")
+
         except KeyboardInterrupt:
-            print("\n\n⚠️  Interrupted by user!")
-            
-        except Exception as e:
-            print(f"\n❌ Error: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            
+            print("\n\n⚠️ Interrupted by user!")
+
         finally:
             if self.driver:
-                self.driver.quit()
+                try:
+                    self.driver.quit()
+                except Exception:
+                    pass
+
 
 def main():
-    """Entry point"""
-    print("\n" + "="*70)
-    print("🎨 PINTEREST IMAGE SCRAPER")
-    print("="*70)
-    print(f"  Keyword:        {SEARCH_KEYWORD}")
-    print(f"  Output Folder:  {OUTPUT_FOLDER}")
-    print(f"  Scrolls:        {NUM_SCROLLS}")
-    print(f"  Scroll Pause:   {SCROLL_PAUSE}s")
-    print(f"  Headless:       {HEADLESS}")
-    print("="*70 + "\n")
-    
+    print("\n" + "=" * 70)
+    print("🎨 PINTEREST IMAGE SCRAPER (HI-RES + 2000 TARGET + DEDUPE)")
+    print("=" * 70)
+    print(f"Keyword:        {SEARCH_KEYWORD}")
+    print(f"Output Folder:  {OUTPUT_FOLDER}")
+    print(f"Target Images:  {TOTAL_IMAGES}")
+    print(f"Min Size:       {MIN_WIDTH}x{MIN_HEIGHT}")
+    print(f"Scroll Pause:   {SCROLL_PAUSE}s")
+    print(f"Scroll Step:    {SCROLL_STEP}")
+    print(f"Headless:       {HEADLESS}")
+    print("=" * 70 + "\n")
+
     scraper = PinterestScraper(
         keyword=SEARCH_KEYWORD,
         output_folder=OUTPUT_FOLDER,
-        num_scrolls=NUM_SCROLLS,
+        total_images=TOTAL_IMAGES,
+        min_width=MIN_WIDTH,
+        min_height=MIN_HEIGHT,
         scroll_pause=SCROLL_PAUSE,
-        headless=HEADLESS
+        scroll_step=SCROLL_STEP,
+        max_scrolls=MAX_SCROLLS,
+        headless=HEADLESS,
     )
-    
     scraper.run()
-    
+
     print("✨ Done!\n")
+
 
 if __name__ == "__main__":
     main()
